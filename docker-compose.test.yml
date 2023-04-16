@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  tt-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      - redis
+
+  redis:
+    image: "redis:latest"
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+
