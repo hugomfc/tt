@@ -2,8 +2,9 @@ package ratelimiter
 
 import (
 	"context"
-	"fmt"
-  "log"
+	"errors"
+	"log"
+
 	//"fmt"
 	"sync"
 	"time"
@@ -14,108 +15,151 @@ import (
 	"github.com/hugomfc/tt/internal/storage"
 )
 
+var (
+	ErrCountingPeriodTooShort = errors.New("counting period too short for the defined sync interval")
+)
+
 type RateLimiter struct {
 	storage       storage.Storage
-	rules          map[string]*compiledRule
-	rulesMutex     sync.RWMutex
-	counters       map[string]map[string]*counter
-	countersMutex  sync.RWMutex
-	syncInterval   time.Duration
-	slotSize       int
+	rules         map[string]*CompiledRule
+	rulesMutex    sync.RWMutex
+	counters      map[string]map[string]*domain.Counter
+	countersMutex sync.RWMutex
+	syncInterval  time.Duration
+	SlotSize      int // in seconds
+
+	// handle sync goroutines and shufdown
+	ctxSync    context.Context
+	cancelSync context.CancelFunc
+	wgSync     sync.WaitGroup
 }
 
-type compiledRule struct {
+type CompiledRule struct {
 	*domain.Rule
-	compiledExpr   *vm.Program
-}
-
-type counter struct {
-  slots domain.Slots
-	lastSyncSlot int 
-  //  groupByKey string
-  rule *domain.Rule
+	compiledExpr *vm.Program
 }
 
 type RequestInfo struct {
-	IP        string
-	Method    string
-	Path      string
-	Headers   map[string]string
-  // TODO: add more
+	IP      string
+	Method  string
+	Path    string
+	Headers map[string]string
+	// TODO: add more
 }
 
-
 func genGroupKey(groupBy []string, info *RequestInfo) *string {
-  var groupByKey string
+	var groupByKey string
 
-  for _, group := range groupBy {
-    switch group {
-    case "ip": groupByKey += info.IP
-    case "path": groupByKey += info.Path
-    case "method": groupByKey += info.Method
-    // TODO: add more
-    }
-  }
-  return &groupByKey
+	for _, group := range groupBy {
+		switch group {
+		case "ip":
+			groupByKey += info.IP
+		case "path":
+			groupByKey += info.Path
+		case "method":
+			groupByKey += info.Method
+			// TODO: add more
+		}
+	}
+	return &groupByKey
 }
 
 func New(storage storage.Storage, syncInterval time.Duration, slotSize int) *RateLimiter {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	rl := &RateLimiter{
-		storage:       storage,
-		rules:         make(map[string]*compiledRule),
-		counters:      make(map[string]map[string]*counter),
-		syncInterval:  syncInterval,
-		slotSize:      slotSize,
+		storage:      storage,
+		rules:        make(map[string]*CompiledRule),
+		counters:     make(map[string]map[string]*domain.Counter),
+		syncInterval: syncInterval,
+		SlotSize:     slotSize,
+
+		ctxSync:    ctx,
+		cancelSync: cancel,
+		//wgSync:   sync.WaitGroup{},
+
 	}
-	go rl.synchronizeRules()
-  go rl.synchronizeCounters()
+	rl.wgSync.Add(2)
+
+	go func() {
+		defer rl.wgSync.Done()
+		rl.synchronizeRules()
+	}()
+
+	go func() {
+		defer rl.wgSync.Done()
+		rl.synchronizeCounters()
+	}()
+
 	return rl
 }
 
+func (rl *RateLimiter) Shutdown() {
+	rl.cancelSync()
+	rl.wgSync.Wait()
+	log.Println("Rate limiter has been shutdown")
+}
+
 func (rl *RateLimiter) Allow(ctx context.Context, info *RequestInfo) (bool, string, error) {
-  now := time.Now().Unix() // TODO: UnixNano in the future for subsecond slotSize
-  log.Println("ALLOW", now, info)
+	now := time.Now().Unix() // TODO: UnixNano in the future for subsecond slotSize
 	rl.rulesMutex.RLock()
 	defer rl.rulesMutex.RUnlock()
 
 	for _, rule := range rl.rules {
-		allowed, err := rl.evaluateRule(ctx, rule, info, now)
+		output, err := expr.Run(rule.compiledExpr, info)
 		if err != nil {
 			return false, "", err
 		}
-		if !allowed {
-			return false, rule.ID, nil
+		if output.(bool) {
+			allowed, err := rl.evaluateRule(ctx, rule, info, now)
+			if err != nil {
+				return false, "", err
+			}
+			if !allowed {
+				return false, rule.ID, nil
+			}
 		}
 	}
 	return true, "", nil
 }
 
-func (rl *RateLimiter) AddRule(ctx context.Context, rule *domain.Rule) error {
+// validate counting period is at least X times the sync interval. This is to make sure
+// that the sync goroutine cleans up the old slots
+func (rl *RateLimiter) isCountingPeriodOk(rule *domain.Rule) bool {
+	//log.Println(time.Duration(rule.CountingPeriod*int(time.Second)), rl.syncInterval*3)
+	return time.Duration(rule.CountingPeriod*int(time.Second)) >= rl.syncInterval*3
+}
+
+func (rl *RateLimiter) AddRule(ctx context.Context, rule domain.Rule) error {
+	if !rl.isCountingPeriodOk(&rule) {
+		return ErrCountingPeriodTooShort
+	}
+
 	compiledExpr, err := expr.Compile(rule.Expression)
 	if err != nil {
 		return err
 	}
 
-	compiledRule := &compiledRule{
-		Rule:         rule,
+	compiledRule := &CompiledRule{
+		Rule:         &rule,
 		compiledExpr: compiledExpr,
 	}
 
 	rl.rulesMutex.Lock()
 	rl.rules[rule.ID] = compiledRule
 	rl.rulesMutex.Unlock()
-  rl.countersMutex.Lock()
-  rl.counters[rule.ID] = make(map[string]*counter)
-  rl.countersMutex.Unlock()
+	rl.countersMutex.Lock()
+	rl.counters[rule.ID] = make(map[string]*domain.Counter)
+	rl.countersMutex.Unlock()
 
-	return rl.storage.AddRule(ctx, rule)
+	return rl.storage.AddRule(ctx, &rule)
 }
 
 func (rl *RateLimiter) HasRule(ctx context.Context, ruleID string) bool {
-  rl.rulesMutex.RLock()
-  defer rl.rulesMutex.RUnlock()
-  _, hasRule := rl.rules[ruleID]
-  return hasRule
+	rl.rulesMutex.RLock()
+	defer rl.rulesMutex.RUnlock()
+	_, hasRule := rl.rules[ruleID]
+	return hasRule
 }
 
 func (rl *RateLimiter) DeleteRule(ctx context.Context, ruleID string) error {
@@ -127,164 +171,163 @@ func (rl *RateLimiter) DeleteRule(ctx context.Context, ruleID string) error {
 }
 
 func (rl *RateLimiter) synchronizeRules() {
-	ctx := context.Background()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-rl.ctxSync.Done():
 			return
 		case <-time.After(rl.syncInterval):
-			rules, err := rl.storage.GetRules(ctx)
+			rules, err := rl.storage.GetRules(rl.ctxSync)
 			if err != nil {
 				continue
 			}
-      for _, rule := range rules {
-			  if !rl.HasRule(ctx, rule.ID) {
-          rl.AddRule(ctx, rule)
-        }
-      }
+			for _, rule := range rules {
+				if !rl.HasRule(rl.ctxSync, rule.ID) {
+					rl.AddRule(rl.ctxSync, *rule)
+				}
+			}
 
 		}
 	}
 }
 
 func (rl *RateLimiter) printSlots(slots domain.Slots) {
-  //for i:=0; i<len(slots); i++ {
-  //  log.Printf("%d:%d", i, slots[i])
-  //}
-  //log.Printf("\n")
-  log.Println(slots)
+	//for i:=0; i<len(slots); i++ {
+	//  log.Printf("%d:%d", i, slots[i])
+	//}
+	//log.Printf("\n")
+	log.Println(">>>>>>", slots)
+}
+
+func (rl *RateLimiter) printSlotsSync(slots domain.Slots) {
+	//for i:=0; i<len(slots); i++ {
+	//  log.Printf("%d:%d", i, slots[i])
+	//}
+	//log.Printf("\n")
+	log.Println("SYNC<<<<", slots)
 }
 
 func (rl *RateLimiter) synchronizeCounters() {
-	ctx := context.Background()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-rl.ctxSync.Done():
 			return
 		case <-time.After(rl.syncInterval):
-      log.Println(rl.syncInterval, "now=", time.Now().Unix())
+			//log.Println("SYNCING COUNTERS")
+			countersToDelete := make([]string, len(rl.counters)/3) // TODO: come up with a better default size for this
 			rl.countersMutex.Lock()
-      rl.rulesMutex.RLock()
-      for _, cRule := range rl.rules {
-        for groupByKey, c := range rl.counters[cRule.ID] {
-          syncTime := time.Now().Unix() // TODO: UnixNano in the future for subsecond slotSize
-          remoteCounters, err := rl.storage.GetCounter(ctx, cRule.Rule, groupByKey)
-          if err != nil {
-            panic(err)
-          }
-           
+			rl.rulesMutex.RLock()
+			for _, cRule := range rl.rules {
+				//log.Println("RULE ID", cRule.ID)
+				for groupByKey, c := range rl.counters[cRule.ID] {
+					syncTime := time.Now().Unix()
+					remoteCounter, errRemote := rl.storage.GetCounter(rl.ctxSync, rl.SlotSize, cRule.Rule, groupByKey)
 
-          log.Print("SYNC ")
-          rl.printSlots(c.slots)
-          log.Print("REDI ")
-          rl.printSlots(*remoteCounters)
+					if errRemote == storage.ErrCounterNotFound {
+						remoteCounter = domain.NewCounter(cRule.Rule, rl.SlotSize)
+					}
+					//rl.printSlots(c.Slots)
+					//rl.printSlots(remoteCounter.Slots)
 
-				  //delta := rl.calculateDelta(c, syncTime)
-          delta := rl.calculateDelta2(c.slots, *remoteCounters, c.lastSyncSlot, rl.calculateSlot2(c.slots, syncTime))
-          if delta==0 {
-            continue
-          } 
-  
-          log.Println("INCR", cRule.Rule, groupByKey, rl.calculateSlot(c, syncTime), delta)
-          v, err := rl.storage.IncrementCounterBy(ctx, cRule.Rule, groupByKey, rl.calculateSlot(c, syncTime), delta)
-				  if err != nil {
-					  continue
-				  }
-          fmt.Println(v, err)
-          if len(*remoteCounters)>cRule.WindowSize/int(rl.slotSize) {
-            panic("unmatching WindowSize / slotSize")
-          } 
-          fmt.Println(len(*remoteCounters))
-          for slot, slotCount := range *remoteCounters {
-            c.slots[slot] = slotCount
-          }
-          c.slots[rl.calculateSlot(c, syncTime)] = v
-          log.Print("2SYNC ")
-          rl.printSlots(c.slots)
+					delta := rl.CalculateDelta2(c.Slots, remoteCounter.Slots, c.LastSyncSlot, c.CalculateSlot(syncTime))
+					if errRemote == storage.ErrCounterNotFound && delta == 0 {
+						//log.Println("DELTA IS 0 AND REMOTE COUNTER NOT FOUND")
+						countersToDelete = append(countersToDelete, groupByKey)
+						continue
+					}
+					//log.Println("DELTA", delta)
+					if delta > 0 {
+						newCount, errRemote := rl.storage.IncrementCounterBy(rl.ctxSync, cRule.Rule, groupByKey, c.CalculateSlot(syncTime), delta)
+						if errRemote != nil {
+							continue
+						}
+						if len(remoteCounter.Slots) > cRule.CountingPeriod/int(rl.SlotSize) {
+							panic("unmatching WindowSize / slotSize")
+						}
+						copy(c.Slots, remoteCounter.Slots)
+						c.Slots[c.CalculateSlot(syncTime)] = newCount
+					} else {
+						copy(c.Slots, remoteCounter.Slots)
+					}
+					c.LastSyncSlot = c.CalculateSlot(syncTime)
+					rl.printSlotsSync(c.Slots)
+					rl.printSlotsSync(remoteCounter.Slots)
 
+				}
+				for _, groupByKey := range countersToDelete {
+					//log.Println("DELETING COUNTER", groupByKey)
 
-				  c.lastSyncSlot = rl.calculateSlot(c, syncTime)
-        }
-      }
-      rl.rulesMutex.RUnlock()
+					delete(rl.counters[cRule.ID], groupByKey)
+				}
+			}
+			rl.rulesMutex.RUnlock()
 			rl.countersMutex.Unlock()
+
 		}
+		//log.Println("FINISHEDSYNCING COUNTERS")
 	}
 }
 
-func (rl *RateLimiter) evaluateRule(ctx context.Context, rule *compiledRule, info *RequestInfo, now int64) (bool, error) {
-  groupByKey := genGroupKey(rule.GroupBy, info)
+func (rl *RateLimiter) evaluateRule(ctx context.Context, rule *CompiledRule, info *RequestInfo, now int64) (bool, error) {
+	groupByKey := genGroupKey(rule.GroupBy, info)
 	rl.countersMutex.Lock()
-
 	c, ok := rl.counters[rule.ID][*groupByKey]
 	if !ok {
-		c = &counter{
-			lastSyncSlot: -1,
-      slots:    make(domain.Slots, rule.WindowSize/int(rl.slotSize)),
-
-      //groupByKey: groupByKey,
-      rule: rule.Rule,
-		}
-		rl.counters[rule.ID][*groupByKey] = c
+		rl.counters[rule.ID][*groupByKey] = domain.NewCounter(rule.Rule, rl.SlotSize)
+		c = rl.counters[rule.ID][*groupByKey]
 	}
-  log.Println("calculateSlot=", rl.calculateSlot(c,now))
-	c.slots[rl.calculateSlot(c, now)]++
-  log.Println("EVAL")
-  rl.printSlots(c.slots)
+	rl.printSlots(c.Slots)
+
+	slot := c.CalculateSlot(now)
+
+	log.Println("calculateSlot=", slot)
+
+	c.Slots[slot]++
+	log.Println("EVAL RULE", rule.ID)
+	//rl.printSlots(c.Slots)
 	rl.countersMutex.Unlock()
 
-
 	sum := 0
-	for _, count := range c.slots {
+	for _, count := range c.Slots {
 		sum += count
 	}
+	rl.printSlots(c.Slots)
 
 	return sum <= rule.Limit, nil
 }
 
-func (rl *RateLimiter) calculateSlot(c *counter, t int64) int {
-  return int(t / int64(rl.slotSize) % int64(len(c.slots)))
-}
-
-func (rl *RateLimiter) calculateSlot2(slots domain.Slots, t int64) int {
-  return int(t / int64(rl.slotSize) % int64(len(slots)))
-}
-
-func (rl *RateLimiter) calculateDelta2(local domain.Slots, remote domain.Slots, lastSyncSlot int, curSlot int) int {
-  delta := 0
-  if lastSyncSlot>0 && local[lastSyncSlot]>remote[lastSyncSlot] {
-    delta += local[lastSyncSlot]-remote[lastSyncSlot] 
-  }
-  delta += local[curSlot]
+func (rl *RateLimiter) CalculateDelta2(local domain.Slots, remote domain.Slots, lastSyncSlot int, curSlot int) int {
+	delta := 0
+	//log.Println("CALCULATE DELTA", lastSyncSlot, curSlot)
+	if lastSyncSlot >= 0 {
+		if local[lastSyncSlot] > remote[lastSyncSlot] {
+			delta += local[lastSyncSlot] - remote[lastSyncSlot]
+		} else {
+			delta = 0
+		}
+	}
+	delta += local[curSlot]
 	local[curSlot] = 0
-  //log.Println("<<<<", c.lastSyncSlot, lastSyncSlot, now, curSlot, delta)
-	//for i := lastSyncSlot+1; i < curSlot; i++ {
-  for i:=lastSyncSlot+1;i!=curSlot;i=(i+1)%len(local) {
-		//slot := i % len(c.slots)
-    slot := i
+	for i := (lastSyncSlot + 1) % len(local); i != curSlot; i = (i + 1) % len(local) {
+		slot := i
 		delta += local[slot]
-    local[slot] = 0
-    //log.Println(">>", i, int(c.rule.WindowSize/rl.slotSize), now, rl.slotSize, slot, delta)
+		local[slot] = 0
 	}
 	return delta
 }
 
-
-
-func (rl *RateLimiter) calculateDelta(c *counter, now int64) int {
-  curSlot := rl.calculateSlot(c, now)
-  lastSyncSlot := c.lastSyncSlot
-  delta := c.slots[curSlot]
-	c.slots[curSlot] = 0
-  log.Println("<<<<", c.lastSyncSlot, lastSyncSlot, now, curSlot, delta)
+func (rl *RateLimiter) calculateDelta(c *domain.Counter, now int64) int {
+	curSlot := c.CalculateSlot(now)
+	lastSyncSlot := c.LastSyncSlot
+	delta := c.Slots[curSlot]
+	c.Slots[curSlot] = 0
+	//log.Println("<<<<", c.LastSyncSlot, lastSyncSlot, now, curSlot, delta)
 	//for i := lastSyncSlot+1; i < curSlot; i++ {
-  for i:=lastSyncSlot+1;i!=curSlot;i=(i+1)%len(c.slots) {
+	for i := lastSyncSlot + 1; i != curSlot; i = (i + 1) % len(c.Slots) {
 		//slot := i % len(c.slots)
-    slot := i
-		delta += c.slots[slot]
-    c.slots[slot] = 0
-    log.Println(">>", i, int(c.rule.WindowSize/rl.slotSize), now, rl.slotSize, slot, delta)
+		slot := i
+		delta += c.Slots[slot]
+		c.Slots[slot] = 0
+		//log.Println(">>", i, int(c.Rule.CountingPeriod/rl.SlotSize), now, rl.SlotSize, slot, delta)
 	}
 	return delta
 }
-

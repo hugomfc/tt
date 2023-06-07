@@ -1,7 +1,7 @@
 FROM redis:latest
 
 # Copy the updated Redis configuration to the container
-COPY redis.conf /usr/local/etc/redis/redis.conf
+COPY redis-test.conf /usr/local/etc/redis/redis.conf
 
 # Update the Redis configuration to allow connections from external IP addresses
 #RUN sed -i 's/bind 127.0.0.1/bind 0.0.0.0/' /usr/local/etc/redis/redis.conf
