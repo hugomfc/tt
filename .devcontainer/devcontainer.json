@@ -4,15 +4,14 @@
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
     "ghcr.io/devcontainers/features/go:1": {}
   },
-  
   "extensions": [
-        "github.vscode-pull-request-github",
-        "ms-azuretools.vscode-docker",
-        "vscode-icons-team.vscode-icons",
-        "visualstudioexptteam.vscodeintellicode",
-        "ms-vscode.go"
-    ],
-    "dockerFile": "Dockerfile",
+	"github.vscode-pull-request-github",
+  "ms-azuretools.vscode-docker",
+	"vscode-icons-team.vscode-icons",
+	"visualstudioexptteam.vscodeintellicode",
+	"ms-vscode.go",
+	"Dunn.redis"
+],
     "settings": {
         "files.exclude": {
             "**/CODE_OF_CONDUCT.md": true,

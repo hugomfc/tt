@@ -28,6 +28,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Evaluate the rate limiting rules
 	allowed, matchedRule, _ := h.rl.Allow(r.Context(), &requestInfo)
+	_ = matchedRule
 	// If rate limiting is triggered, respond with the appropriate HTTP status code and headers
 	log.Println("allowed:", allowed, "matchedRule:", matchedRule, "reqInfo:", requestInfo)
 	if !allowed {
